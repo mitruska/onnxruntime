@@ -81,6 +81,7 @@ target_link_libraries(onnxruntime PRIVATE
     ${PROVIDERS_DML}
     ${PROVIDERS_ACL}
     ${onnxruntime_winml}
+    ${PROVIDERS_HIP}
     onnxruntime_optimizer
     onnxruntime_providers
     onnxruntime_util

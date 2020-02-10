@@ -173,6 +173,8 @@ Use the individual flags to only run the specified stages.
     parser.add_argument("--use_telemetry", action='store_true', help="Only official builds can set this flag to enable telemetry.")
     parser.add_argument("--enable_wcos", action='store_true', help="Build for Windows Core OS.")
     parser.add_argument("--enable_lto", action='store_true', help="Enable Link Time Optimization")
+    parser.add_argument("--use_hip", action='store_true', help="Build with ROCM")
+    parser.add_argument("--hip_home", help="Path to HIP installation dir")
     return parser.parse_args()
 
 def resolve_executable_path(command_or_path):
@@ -298,7 +300,7 @@ def setup_test_data(build_dir, configs):
                 log.debug("creating shortcut %s -> %s"  % (src_model_dir, dest_model_dir))
                 run_subprocess(['mklink', '/D', '/J', dest_model_dir, src_model_dir], shell=True)
 
-def generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home, tensorrt_home, path_to_protoc_exe, configs, cmake_extra_defines, args, cmake_extra_args):
+def generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home, tensorrt_home, hip_home, path_to_protoc_exe, configs, cmake_extra_defines, args, cmake_extra_args):
     log.info("Generating CMake build tree")
     cmake_dir = os.path.join(source_dir, "cmake")
     # TODO: fix jemalloc build so it does not conflict with onnxruntime shared lib builds. (e.g. onnxuntime_pybind)
@@ -356,6 +358,8 @@ def generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home
                  "-Donnxruntime_ENABLE_TRAINING=" + ("ON" if args.enable_training else "OFF"),
                  "-Donnxruntime_ENABLE_TRAINING_E2E_TESTS=" + ("ON" if args.enable_training_e2e_tests else "OFF"),
                  "-Donnxruntime_USE_HOROVOD=" + ("ON" if args.use_horovod else "OFF"),
+                 "-Donnxruntime_USE_HIP=" + ("ON" if args.use_hip else "OFF"),
+                 "-Donnxruntime_HIP_HOME=" + (hip_home if args.use_hip else ""),
                  ]
 
     # temp turn on only for linux gpu build
@@ -594,6 +598,22 @@ def setup_dml_build(args, cmake_path, build_dir, configs):
                         "--config", config,
                         "--target", "RESTORE_PACKAGES"]
             run_subprocess(cmd_args)
+
+def setup_hip_vars(args):
+
+    hip_home = None
+
+    if (args.use_hip):
+        print("hip_home = {}".format(args.hip_home))
+        hip_home = args.hip_home or None
+
+        hip_home_not_valid = (hip_home and not os.path.exists(hip_home))
+
+        if (hip_home_not_valid):
+            raise BuildError("hip_home paths must be specified and valid.",
+                             "hip_home='{}' valid={}."
+                             .format(hip_home, hip_home_not_valid))
+    return hip_home or ''
 
 
 def adb_push(source_dir, src, dest, **kwargs):
@@ -956,6 +976,9 @@ def main():
     # if using tensorrt, setup tensorrt paths
     tensorrt_home = setup_tensorrt_vars(args)
 
+    # if using hip, setup hip paths
+    hip_home = setup_hip_vars(args)
+  
     os.makedirs(build_dir, exist_ok=True)
 
     log.info("Build started")
@@ -1014,7 +1037,7 @@ def main():
         if args.path_to_protoc_exe:
             path_to_protoc_exe = args.path_to_protoc_exe
 
-        generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home, tensorrt_home, path_to_protoc_exe, configs, cmake_extra_defines,
+        generate_build_tree(cmake_path, source_dir, build_dir, cuda_home, cudnn_home, tensorrt_home, hip_home, path_to_protoc_exe, configs, cmake_extra_defines,
                             args, cmake_extra_args)
 
     if (args.clean):
