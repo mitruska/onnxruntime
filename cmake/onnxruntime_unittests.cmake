@@ -183,6 +183,12 @@ if (onnxruntime_ENABLE_TRAINING)
       )
     list(APPEND onnxruntime_test_providers_src ${orttraining_test_trainingops_cuda_src})
   endif()
+  if (onnxruntime_USE_HIP)
+    file(GLOB_RECURSE orttraining_test_trainingops_hip_src CONFIGURE_DEPENDS
+      "${ORTTRAINING_SOURCE_DIR}/test/training_ops/hip/*"
+      )
+    list(APPEND onnxruntime_test_providers_src ${orttraining_test_trainingops_hip_src})
+  endif()
 endif()
 
 if (onnxruntime_USE_NGRAPH)
@@ -400,7 +406,7 @@ endif()
 set(all_dependencies ${onnxruntime_test_providers_dependencies} )
 
   if (onnxruntime_ENABLE_TRAINING)
-    if(${CMAKE_BUILD_TYPE} MATCHES "Debug" AND NOT onnxruntime_USE_CUDA)
+    if(${CMAKE_BUILD_TYPE} MATCHES "Debug" AND NOT onnxruntime_USE_CUDA AND NOT onnxruntime_USE_HIP)
       file(GLOB grad_test_src "${ORTTRAINING_SOURCE_DIR}/test/gradient/*.cc")
       list(REMOVE_ITEM onnxruntime_test_training_src ${grad_test_src})
     endif()
