@@ -117,7 +117,7 @@ TEST(GatherNDOpTest, GatherND_slice_float_int32_t_axis_2) {
   test.Run();
 }
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_HIP)
 #if __CUDA_ARCH__ >= 600
 TEST(GatherNDOpTest, GatherND_slice_double_int64_t_axis_3) {
   OpTester test("GatherND", 1, onnxruntime::kOnnxDomain);
