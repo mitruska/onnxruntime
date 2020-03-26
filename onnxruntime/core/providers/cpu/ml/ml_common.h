@@ -185,16 +185,15 @@ static inline float ErfInv(float x) {
 }
 
 //https://www.csie.ntu.edu.tw/~cjlin/papers/svmprob/svmprob.pdf
-static inline void multiclass_probability(int64_t classcount, const std::vector<float>& r, std::vector<float>& p) {
+static inline void multiclass_probability(int64_t classcount,
+                                          const gsl::span<const float>& r,
+                                          const gsl::span<float>& p) {
   int64_t sized2 = classcount * classcount;
   std::vector<float> Q;
   std::vector<float> Qp;
-  for (int64_t k = 0; k < sized2; k++) {
-    Q.push_back(0);
-  }
-  for (int64_t k = 0; k < classcount; k++) {
-    Qp.push_back(0);
-  }
+  Q.assign(sized2, 0.f);
+  Qp.assign(classcount, 0.f);
+
   float eps = 0.005f / static_cast<float>(classcount);
   for (int64_t i = 0; i < classcount; i++) {
     p[i] = 1.0f / static_cast<float>(classcount);  // Valid if k = 1
@@ -207,6 +206,7 @@ static inline void multiclass_probability(int64_t classcount, const std::vector<
       Q[i * classcount + j] = -r[j * classcount + i] * r[i * classcount + j];
     }
   }
+
   for (int64_t loop = 0; loop < 100; loop++) {
     // stopping condition, recalculate QP,pQP for numerical accuracy
     float pQp = 0;
@@ -217,6 +217,7 @@ static inline void multiclass_probability(int64_t classcount, const std::vector<
       }
       pQp += p[i] * Qp[i];
     }
+
     float max_error = 0;
     for (int64_t i = 0; i < classcount; i++) {
       float error = std::fabs(Qp[i] - pQp);
@@ -224,6 +225,7 @@ static inline void multiclass_probability(int64_t classcount, const std::vector<
         max_error = error;
       }
     }
+
     if (max_error < eps) break;
 
     for (int64_t i = 0; i < classcount; i++) {

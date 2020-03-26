@@ -100,9 +100,13 @@ int _set_score_svm(Tensor* Y, float max_weight, const int64_t maxclass, const in
   }
   return write_additional_scores;
 }
-
 template <typename T>
 Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
+  ORT_NOT_IMPLEMENTED();
+}
+
+template <>
+Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
   const auto* X = ctx->Input<Tensor>(0);
 
   int64_t stride = X->Shape().NumDimensions() == 1 ? X->Shape()[0] : X->Shape()[1];
@@ -110,10 +114,26 @@ Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
 
   Tensor* Y = ctx->Output(0, TensorShape({N}));
 
+  concurrency::ThreadPool* threadpool = ctx->GetOperatorThreadPool();
+
+  // X: [num_batches, feature_count_] where features could be coefficients or support vectors
+  // support_vectors_ : [vector_count_, feature_count_]
+  // vectors per class: entries that sum to vector_count_
+
+  // Y: [num_batches, 1]
+
+  // Total number of classifiers comparing pairs between the classes
+  // e.g. if you have A, B C and D classes, the number of classifiers to compare between each pair is 6
+  //      with AB, AC, AD, BC, BD and CD
+  const int64_t class_count_squared = class_count_ * class_count_;
+  const int64_t num_classifiers = class_count_ * (class_count_ - 1) / 2;  // == (class_count_-1)!
+  const bool have_proba = proba_.size() > 0;
+
   int64_t nb_columns = class_count_;
-  if (proba_.size() == 0 && vector_count_ > 0) {
+
+  if (!have_proba && mode_ == SVM_TYPE::SVM_SVC) {
     if (class_count_ > 2)
-      nb_columns = class_count_ * (class_count_ - 1) / 2;
+      nb_columns = num_classifiers;
     else
       nb_columns = 2;
   }
@@ -121,83 +141,170 @@ Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
   std::vector<int64_t> dims{N, nb_columns};
   Tensor* Z = ctx->Output(1, TensorShape(dims));
 
-  const T* x_data = X->template Data<T>();
+  const auto x_data = X->template DataAsSpan<float>();
   int64_t zindex = 0;
 
-  std::vector<float> scores;
-  std::vector<float> kernels;
-  std::vector<int64_t> votes;
-  std::vector<float> probsp2;
+  std::vector<float> scores_data;
+  std::vector<float> kernels_data;
+  std::vector<int64_t> votes_data;
 
-  const int64_t class_count_squared = class_count_ * class_count_;
-  probsp2.reserve(class_count_squared);
-  scores.reserve(class_count_squared);
+  std::vector<float> classifier_scores_data;
+  std::vector<float> probsp2_data;
 
-  for (int64_t n = 0; n < N; n++)  //for each example
-  {
-    scores.clear();
-    kernels.clear();
+  scores_data.resize(N * class_count_);
 
-    int64_t current_weight_0 = n * stride;
-    int64_t maxclass = -1;
+  if (have_proba && mode_ == SVM_TYPE::SVM_SVC) {
+    probsp2_data.resize(N * class_count_squared, 0.f);
+  }
 
-    if (vector_count_ == 0 && mode_ == SVM_TYPE::SVM_LINEAR) {
-      for (int64_t j = 0; j < class_count_; j++) {  //for each class
-        auto val = kernel_dot(x_data, current_weight_0, coefficients_, feature_count_ * j,
-                              feature_count_, get_kernel_type());
-        val += rho_[0];
-        scores.push_back(val);
-      }
+  // scores.reserve(class_count_squared);  // FIXME. N x class_count_ for linear. N x num_classifiers first for other path, then N x class_count_
+
+  // need class_count_ per batch
+  // votes.reserve(N * class_count_);
+
+  // X: [num_batches, feature_count_] where features could be coefficients or support vectors
+  // coefficients_: if linear [class_count, feature_count]
+  //                else      [num_classes - 1, vector_count_]
+  // support_vectors_ : [vector_count_, feature_count_]
+
+  // Y: [num_batches, 1]
+  // Z: [num_batches, class_count] ??? does write extra scores increase that to 2xclass_count?
+  int64_t num_scores_per_batch = class_count_;
+
+  if (mode_ == SVM_TYPE::SVM_LINEAR) {
+    // combine the coefficients with the input data and apply the kernel type
+    auto out = gsl::make_span<float>(scores_data.data(), scores_data.size());
+    batched_kernel_dot(x_data, coefficients_, N, class_count_, feature_count_, rho_[0], out, threadpool);
+
+    //for (int64_t j = 0; j < class_count_; j++) {  //for each class
+    //  auto val = kernel_dot(x_data, current_weight_0, coefficients_, feature_count_ * j,
+    //                        feature_count_, get_kernel_type());
+    //  val += rho_[0];
+    //  scores.push_back(val);  // N x class_count_ (coefficients is {class_count,feature_count} so N,feature . feature, class
+    //}
+  } else {
+    float* classifier_scores = scores_data.data();
+
+    if (mode_ == SVM_TYPE::SVM_SVC && proba_.size() > 0) {
+      // we will write N * num_classifiers scores first, and then reduce to N * class_count_, so need
+      // to use a separate buffer for the first scoring.
+      classifier_scores_data.resize(N * num_classifiers);
+      classifier_scores = classifier_scores_data.data();
     } else {
-      if (vector_count_ == 0)
-        return Status(common::ONNXRUNTIME, common::FAIL, "No support vectors.");
-      int evals = 0;
+      // we will write directly to scores_data
+      num_scores_per_batch = num_classifiers;
+    }
 
-      for (int64_t j = 0; j < vector_count_; j++) {
-        auto val = kernel_dot(x_data, current_weight_0, support_vectors_, feature_count_ * j,
-                              feature_count_, get_kernel_type());
-        kernels.push_back(val);
-      }
+    kernels_data.resize(N * vector_count_);
+    votes_data.resize(N * class_count_, 0);
 
-      votes.assign(class_count_, 0);
-      for (int64_t i = 0; i < class_count_; i++) {        // for each class
-        for (int64_t j = i + 1; j < class_count_; j++) {  // for each class
-          double sum = 0;
-          int64_t start_index_i = starting_vector_[i];  // *feature_count_;
-          int64_t start_index_j = starting_vector_[j];  // *feature_count_;
+    // combine the input data with the support vectors and apply the kernel type
+    // output is {num_batches, vector_count_}
+    auto kernels_span = gsl::make_span<float>(kernels_data.data(), kernels_data.size());
+    batched_kernel_dot(x_data, support_vectors_, N, vector_count_, feature_count_, 0.f, kernels_span,
+                       threadpool);
 
-          int64_t class_i_support_count = vectors_per_class_[i];
+    // ## combine inputs with support vectors as per SVMR. write to kernels.data()
+    //for (int64_t j = 0; j < vector_count_; j++) {
+    //  auto val = kernel_dot(x_data, current_weight_0, support_vectors_, feature_count_ * j,
+    //                        feature_count_, get_kernel_type());
+    //  *kernel = val;
+    //  ++kernel;
+    //}
+
+    for (int64_t n = 0; n < N; n++) {
+      float* kernels = kernels_data.data() + (n * vector_count_);
+      float* scores = classifier_scores + (n * num_classifiers);
+      int64_t* votes = votes_data.data() + (n * class_count_);
+
+      // reduce scores from kernels using coefficients, taking into account the varying number of support vectors
+      // per class.
+      // coefficients: [num_classes - 1, vector_count_]
+      //
+      // e.g. say you have 3 classes, with 3 x 3 coefficients
+      //
+      // AA AB AC
+      // BA BB BC
+      // CA CB CC
+      //
+      // you can remove the items comparing a class with itself leaving one less row.
+      //
+      // BA AB AC
+      // CA CB BC
+      //
+      // for each class there is a coefficient per support vector, and a class has one or more support vectors.
+      //
+      // Combine the scores for the two combinations for two classes with their coefficient.
+      // e.g. AB combines with BA.
+      // If A has 3 support vectors and B has 2, there's a 3x2 block for AB and a 2x3 block for BA to combine
+      //
+
+      // votes.assign(class_count_, 0);
+      for (int64_t i = 0; i < class_count_ - 1; i++) {
+        int64_t start_index_i = starting_vector_[i];  // start of support vectors for class i
+        int64_t class_i_support_count = vectors_per_class_[i];
+        int64_t i_coeff_row_offset = vector_count_ * i;
+
+        for (int64_t j = i + 1; j < class_count_; j++) {
+          int64_t start_index_j = starting_vector_[j];  // start of support vectors for class j
           int64_t class_j_support_count = vectors_per_class_[j];
+          int64_t j_coeff_row_offset = vector_count_ * (j - 1);
 
-          int64_t pos1 = (vector_count_) * (j - 1);
-          int64_t pos2 = (vector_count_) * (i);
-          const float* val1 = &(coefficients_[pos1 + start_index_i]);
+          double sum = 0;
+
+          const float* val1 = &(coefficients_[j_coeff_row_offset + start_index_i]);
           const float* val2 = &(kernels[start_index_i]);
           for (int64_t m = 0; m < class_i_support_count; ++m, ++val1, ++val2)
             sum += *val1 * *val2;
 
-          val1 = &(coefficients_[pos2 + start_index_j]);
+          val1 = &(coefficients_[i_coeff_row_offset + start_index_j]);
           val2 = &(kernels[start_index_j]);
+
           for (int64_t m = 0; m < class_j_support_count; ++m, ++val1, ++val2)
             sum += *val1 * *val2;
 
-          sum += rho_[evals];
-          scores.push_back((float)sum);
-          ++(votes[sum > 0 ? i : j]);
-          ++evals;  //index into rho
+          sum += rho_[i];  // rho_ entry for this classifier
+
+          *scores = static_cast<float>(sum);
+          ++scores;
+          ++votes[sum > 0 ? i : j];
+
+          // ++(votes[sum > 0 ? i : j]);
+          // scores.push_back(static_cast<float>(sum));  // N * num_classifiers
         }
       }
-    }
 
-    if (proba_.size() > 0 && mode_ == SVM_TYPE::SVM_SVC) {
-      //compute probabilities from the scores
-      probsp2.assign(class_count_squared, 0.f);
+      assert(scores == classifier_scores + ((n + 1) * num_classifiers));
+    }
+  }
+
+  for (int64_t n = 0; n < N; n++)  //for each example
+  {
+    float* _scores = scores_data.data() + (n + num_scores_per_batch);
+
+    //!!!
+    // temporary copy of scores into vector until other parts handle a gsl::span instead
+    //!!!
+    std::vector<float> scores(_scores, _scores + num_scores_per_batch);
+
+    auto probsp2 = gsl::make_span<float>(probsp2_data.data() + (n * class_count_squared), class_count_squared);
+
+    if (mode_ == SVM_TYPE::SVM_SVC && proba_.size() > 0) {
+      float* classifier_scores = classifier_scores_data.data() + (n * num_classifiers);
+
+      // compute probabilities from the scores. output is { class_count, class_count }
+      // probsp2.assign(class_count_squared, 0.f);
+      // zero out the diagonal
+      // for (int64_t i = 0; i < class_count_; ++i) {
+      //   probsp2[i * class_count_ + i] = 0.f;
+      // }
+
       int64_t index = 0;
-      for (int64_t i = 0; i < class_count_; ++i) {
+      for (int64_t i = 0; i < class_count_ - 1; ++i) {
         int64_t p1 = i * class_count_ + i + 1;
         int64_t p2 = (i + 1) * class_count_ + i;
         for (int64_t j = i + 1; j < class_count_; ++j, ++index) {
-          float val1 = sigmoid_probability(scores[index], proba_[index], probb_[index]);
+          float val1 = sigmoid_probability(classifier_scores[index], proba_[index], probb_[index]);
           float val2 = std::max(val1, 1.0e-7f);
           val2 = std::min(val2, 1 - 1.0e-7f);
           probsp2[p1] = val2;
@@ -207,17 +314,18 @@ Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
         }
       }
 
-      scores.assign(class_count_, 0.f);
       multiclass_probability(class_count_, probsp2, scores);
     }
 
     float max_weight = 0;
-    if (votes.size() > 0) {
-      auto it_maxvotes = std::max_element(votes.begin(), votes.end());
-      maxclass = std::distance(votes.begin(), it_maxvotes);
+    int64_t maxclass = -1;
+    if (votes_data.size() > 0) {
+      auto votes = gsl::make_span<int64_t>(votes_data.data() + (n * class_count_), class_count_);
+      auto it_maxvotes = std::max_element(votes.cbegin(), votes.cend());
+      maxclass = std::distance(votes.cbegin(), it_maxvotes);
     } else {
-      auto it_max_weight = std::max_element(scores.begin(), scores.end());
-      maxclass = std::distance(scores.begin(), it_max_weight);
+      auto it_max_weight = std::max_element(scores.cbegin(), scores.cend());
+      maxclass = std::distance(scores.cbegin(), it_max_weight);
       max_weight = *it_max_weight;
     }
 
@@ -226,13 +334,13 @@ Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
     int write_additional_scores = -1;
     if (rho_.size() == 1) {
       if (using_strings_) {
-        write_additional_scores = _set_score_svm<std::string>(
-            Y, max_weight, maxclass, n, post_transform_, proba_,
-            weights_are_all_positive_, classlabels_strings_, "1", "0");
+        write_additional_scores = _set_score_svm<std::string>(Y, max_weight, maxclass, n, post_transform_, proba_,
+                                                              weights_are_all_positive_, classlabels_strings_,
+                                                              "1", "0");
       } else {
-        write_additional_scores = _set_score_svm<int64_t>(
-            Y, max_weight, maxclass, n, post_transform_, proba_,
-            weights_are_all_positive_, classlabels_ints_, 1, 0);
+        write_additional_scores = _set_score_svm<int64_t>(Y, max_weight, maxclass, n, post_transform_, proba_,
+                                                          weights_are_all_positive_, classlabels_ints_,
+                                                          1, 0);
       }
     } else {  //multiclass
       if (using_strings_) {
@@ -242,6 +350,8 @@ Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
       }
     }
 
+    // we only write an extra score if there are 2 classes, and num_scores_per_batch == num_classifiers
+    // which means there's only one entry in scores
     write_scores(scores, post_transform_, zindex, Z, write_additional_scores);
     zindex += scores.size();
   }
