@@ -76,7 +76,7 @@ TEST(MLOpTest, SVMClassifierMulticlassLinearSVC) {
       -2.45976996f, 8.87092972f, -3.76557732f, -6.76487541f,
       92.7596283f, 3.99134970f, -151.693329f, 1.44020212f};
 
-  test.AddAttribute("kernel_type", std::string("RBF"));
+  test.AddAttribute("kernel_type", std::string("LINEAR"));
   test.AddAttribute("coefficients", dual_coefficients);
   test.AddAttribute("rho", rho);
   test.AddAttribute("kernel_params", kernel_params);
@@ -85,6 +85,7 @@ TEST(MLOpTest, SVMClassifierMulticlassLinearSVC) {
   test.AddInput<float>("X", {8, 3}, X);
   test.AddOutput<int64_t>("Y", {8}, predictions);
   test.AddOutput<float>("Z", {8, 4}, scores);
+  test.SetOutputRelErr("Z", 0.00001f);
 
   test.Run();
 }
