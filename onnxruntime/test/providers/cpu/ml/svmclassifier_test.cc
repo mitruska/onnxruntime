@@ -224,27 +224,27 @@ TEST(MLOpTest, SVMClassifierSVCDouble) {
 TEST(MLOpTest, SVMClassifierLinear) {
   OpTester test("SVMClassifier", 1, onnxruntime::kMLDomain);
 
-  std::vector<float> coefficients = {0.766398549079895, 0.0871576070785522, 0.110420741140842,
-                                     -0.963976919651031};
-  std::vector<float> support_vectors = {4.80000019073486, 3.40000009536743, 1.89999997615814,
-                                        5., 3., 1.60000002384186,
-                                        4.5, 2.29999995231628, 1.29999995231628,
-                                        5.09999990463257, 2.5, 3.};
-  std::vector<float> rho = {2.23510527610779};
-  std::vector<float> kernel_params = {0.122462183237076, 0, 3};  //gamma, coef0, degree
+  std::vector<float> coefficients = {0.766398549079895f, 0.0871576070785522f, 0.110420741140842f,
+                                     -0.963976919651031f};
+  std::vector<float> support_vectors = {4.80000019073486f, 3.40000009536743f, 1.89999997615814f,
+                                        5.f, 3.f, 1.60000002384186f,
+                                        4.5f, 2.29999995231628f, 1.29999995231628f,
+                                        5.09999990463257f, 2.5f, 3.f};
+  std::vector<float> rho = {2.23510527610779f};
+  std::vector<float> kernel_params = {0.122462183237076f, 0.f, 3.f};  //gamma, coef0, degree
   std::vector<int64_t> classes = {0, 1};
   std::vector<int64_t> vectors_per_class = {3, 1};
 
-  std::vector<float> X = {5.1, 3.5, 1.4,
-                          4.9, 3., 1.4,
-                          4.7, 3.2, 1.3,
-                          4.6, 3.1, 1.5,
-                          5., 3.6, 1.4};
-  std::vector<float> scores_predictions = {-1.5556798, 1.5556798,
-                                           -1.2610321, 1.2610321,
-                                           -1.5795376, 1.5795376,
-                                           -1.3083477, 1.3083477,
-                                           -1.6572928, 1.6572928};
+  std::vector<float> X = {5.1f, 3.5f, 1.4f,
+                          4.9f, 3.f, 1.4f,
+                          4.7f, 3.2f, 1.3f,
+                          4.6f, 3.1f, 1.5f,
+                          5.f, 3.6f, 1.4f};
+  std::vector<float> scores_predictions = {-1.5556798f, 1.5556798f,
+                                           -1.2610321f, 1.2610321f,
+                                           -1.5795376f, 1.5795376f,
+                                           -1.3083477f, 1.3083477f,
+                                           -1.6572928f, 1.6572928f};
 
   std::vector<int64_t> class_predictions = {0, 0, 0, 0, 0};
 

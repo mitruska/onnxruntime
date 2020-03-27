@@ -69,7 +69,7 @@ SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
   ORT_ENFORCE(proba_.size() == probb_.size());
   ORT_ENFORCE(coefficients_.size() > 0);
   weights_are_all_positive_ = std::all_of(coefficients_.cbegin(), coefficients_.cend(),
-                                          [](int64_t value) { return value >= 0.f; });
+                                          [](float value) { return value >= 0.f; });
 }
 
 template <typename LabelType>
@@ -101,7 +101,6 @@ static int _set_score_svm(Tensor* Y, float max_weight, const int64_t maxclass, c
 
 template <typename LabelType>
 static void ChooseClass(Tensor& output, const int64_t output_idx, float max_weight, const int64_t maxclass,
-                        POST_EVAL_TRANSFORM post_transform_,
                         bool have_proba, bool weights_are_all_positive,
                         const std::vector<LabelType>& classlabels,
                         const LabelType& posclass, const LabelType& negclass) {
@@ -126,7 +125,7 @@ static void ChooseClass(Tensor& output, const int64_t output_idx, float max_weig
 }
 
 template <typename T>
-Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
+Status SVMClassifier<T>::Compute(OpKernelContext* /*ctx*/) const {
   ORT_NOT_IMPLEMENTED();
 }
 
@@ -329,12 +328,10 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     // onnx specs expects one column per class.
     if (num_classifiers == 1) {  // binary case
       if (using_strings_) {
-        ChooseClass<std::string>(Y, n, max_weight, maxclass, post_transform_,
-                                 have_proba, weights_are_all_positive_,
+        ChooseClass<std::string>(Y, n, max_weight, maxclass, have_proba, weights_are_all_positive_,
                                  classlabels_strings_, "1", "0");
       } else {
-        ChooseClass<int64_t>(Y, n, max_weight, maxclass, post_transform_,
-                             have_proba, weights_are_all_positive_,
+        ChooseClass<int64_t>(Y, n, max_weight, maxclass, have_proba, weights_are_all_positive_,
                              classlabels_ints_, 1, 0);
       }
     } else {  //multiclass
