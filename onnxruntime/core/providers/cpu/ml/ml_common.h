@@ -396,7 +396,8 @@ static void write_scores(std::vector<T>& scores, POST_EVAL_TRANSFORM post_transf
 //       was seen from testing with the arbitrary values of 1000 scores per threads.
 template <typename T>
 void batched_update_scores_inplace(gsl::span<T> scores, int64_t num_batches_in, int64_t batch_size,
-                                   POST_EVAL_TRANSFORM post_transform, int add_second_class,
+                                   POST_EVAL_TRANSFORM post_transform,
+                                   int add_second_class, bool have_space_for_second_class,
                                    concurrency::ThreadPool* threadpool) {
   if (batch_size < 1)
     return;
@@ -486,12 +487,22 @@ void batched_update_scores_inplace(gsl::span<T> scores, int64_t num_batches_in, 
           ORT_THROW("Unexpected value for 'add_second_class' of ", add_second_class);
       }
 
-      const float* cur_in = s_end;
-      float* cur_out = &*scores.end();
-      while (cur_in > s) {
-        --cur_in;
-        cur_out -= 2;
-        update_scores(*cur_in, cur_out);
+      if (have_space_for_second_class) {
+        // forward iteration as there's a gap between each score to write into
+        float* cur_score = scores.data();
+        for (int i = 0; i < num_batches; ++i) {
+          update_scores(*cur_score, cur_score);
+          cur_score += 2;
+        }
+      } else {
+        // reverse iteration as the scores are packed together and each score needs to be expanded to two
+        const float* cur_in = s_end;
+        float* cur_out = &*scores.end();
+        while (cur_in > s) {
+          --cur_in;
+          cur_out -= 2;
+          update_scores(*cur_in, cur_out);
+        }
       }
     }
   }

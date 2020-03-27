@@ -68,19 +68,15 @@ SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
   ORT_ENFORCE(classlabels_strings_.size() > 0 || classlabels_ints_.size() > 0);
   ORT_ENFORCE(proba_.size() == probb_.size());
   ORT_ENFORCE(coefficients_.size() > 0);
-  weights_are_all_positive_ = true;
-  for (int64_t i = 0; i < static_cast<int64_t>(coefficients_.size()); i++) {
-    if (coefficients_[i] < 0) {
-      weights_are_all_positive_ = false;
-      break;
-    }
-  }
+  weights_are_all_positive_ = std::all_of(coefficients_.cbegin(), coefficients_.cend(),
+                                          [](int64_t value) { return value >= 0.f; });
 }
 
 template <typename LabelType>
-int _set_score_svm(Tensor* Y, float max_weight, const int64_t maxclass, const int64_t n,
-                   POST_EVAL_TRANSFORM post_transform_, const std::vector<float>& proba_, bool weights_are_all_positive_,
-                   const std::vector<LabelType>& classlabels, LabelType posclass, LabelType negclass) {
+static int _set_score_svm(Tensor* Y, float max_weight, const int64_t maxclass, const int64_t n,
+                          POST_EVAL_TRANSFORM post_transform_, const std::vector<float>& proba_,
+                          bool weights_are_all_positive_,
+                          const std::vector<LabelType>& classlabels, LabelType posclass, LabelType negclass) {
   int write_additional_scores = -1;
   auto output_data = Y->template MutableData<LabelType>();
   if (classlabels.size() == 2) {
@@ -102,6 +98,33 @@ int _set_score_svm(Tensor* Y, float max_weight, const int64_t maxclass, const in
   }
   return write_additional_scores;
 }
+
+template <typename LabelType>
+static void ChooseClass(Tensor& output, const int64_t output_idx, float max_weight, const int64_t maxclass,
+                        POST_EVAL_TRANSFORM post_transform_,
+                        bool have_proba, bool weights_are_all_positive,
+                        const std::vector<LabelType>& classlabels,
+                        const LabelType& posclass, const LabelType& negclass) {
+  LabelType& output_data = *(output.template MutableData<LabelType>() + output_idx);
+
+  if (classlabels.size() == 2) {
+    if (!have_proba) {
+      if (weights_are_all_positive && max_weight >= 0.5)
+        output_data = classlabels[1];
+      else if (max_weight > 0 && !weights_are_all_positive)
+        output_data = classlabels[1];
+      else
+        output_data = classlabels[maxclass];
+    } else {
+      output_data = classlabels[maxclass];
+    }
+  } else if (max_weight > 0) {
+    output_data = posclass;
+  } else {
+    output_data = negclass;
+  }
+}
+
 template <typename T>
 Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
   ORT_NOT_IMPLEMENTED();
@@ -109,44 +132,38 @@ Status SVMClassifier<T>::Compute(OpKernelContext* ctx) const {
 
 template <>
 Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
-  const auto* X = ctx->Input<Tensor>(0);
-
-  int64_t stride = X->Shape().NumDimensions() == 1 ? X->Shape()[0] : X->Shape()[1];
-  int64_t N = X->Shape().NumDimensions() == 1 ? 1 : X->Shape()[0];
-
-  Tensor* Y = ctx->Output(0, TensorShape({N}));
-
   concurrency::ThreadPool* threadpool = ctx->GetOperatorThreadPool();
-
-  // X: [num_batches, feature_count_] where features could be coefficients or support vectors
-  // support_vectors_ : [vector_count_, feature_count_]
-  // vectors per class: entries that sum to vector_count_
-
-  // Y: [num_batches, 1]
+  const auto* X = ctx->Input<Tensor>(0);
+  const auto x_data = X->template DataAsSpan<float>();
+  const auto num_batches = X->Shape().NumDimensions() == 1 ? 1 : X->Shape()[0];
 
   // Total number of classifiers comparing pairs between the classes
   // e.g. if you have A, B C and D classes, the number of classifiers to compare between each pair is 6
   //      with AB, AC, AD, BC, BD and CD
-  const int64_t class_count_squared = class_count_ * class_count_;
   const int64_t num_classifiers = class_count_ * (class_count_ - 1) / 2;  // == (class_count_-1)!
+  const int64_t class_count_squared = class_count_ * class_count_;
   const bool have_proba = proba_.size() > 0;
 
-  int64_t nb_columns = class_count_;
-
-  if (!have_proba && mode_ == SVM_TYPE::SVM_SVC) {
+  int64_t final_scores_per_batch = class_count_;
+  if (mode_ == SVM_TYPE::SVM_SVC && !have_proba) {
     if (class_count_ > 2)
-      nb_columns = num_classifiers;
+      final_scores_per_batch = num_classifiers;
     else
-      nb_columns = 2;
+      final_scores_per_batch = 2;
   }
 
-  std::vector<int64_t> dims{N, nb_columns};
-  Tensor* Z = ctx->Output(1, TensorShape(dims));
+  // Input shapes
+  // X: [num_batches, feature_count_] where features could be coefficients or support vectors
+  // coefficients_: if linear [class_count, feature_count]
+  //                else      [num_classes - 1, vector_count_]
+  // support_vectors_ : [vector_count_, feature_count_]
 
-  const auto x_data = X->template DataAsSpan<float>();
-  int64_t zindex = 0;
+  // both outputs are required so can't be nullptr
+  Tensor& Y = *ctx->Output(0, TensorShape({num_batches}));
+  Tensor& Z = *ctx->Output(1, TensorShape({num_batches, final_scores_per_batch}));
 
-  std::vector<float> scores_data;
+  auto final_scores = Z.MutableDataAsSpan<float>();
+
   std::vector<float> kernels_data;
   std::vector<int64_t> votes_data;
 
@@ -154,66 +171,61 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
   std::vector<float> probsp2_data;
 
   if (have_proba && mode_ == SVM_TYPE::SVM_SVC) {
-    probsp2_data.resize(N * class_count_squared, 0.f);
+    probsp2_data.resize(num_batches * class_count_squared, 0.f);
   }
 
-  // scores.reserve(class_count_squared);  // FIXME. N x class_count_ for linear. N x num_classifiers first for other path, then N x class_count_
-
-  // need class_count_ per batch
-  // votes.reserve(N * class_count_);
-
-  // X: [num_batches, feature_count_] where features could be coefficients or support vectors
-  // coefficients_: if linear [class_count, feature_count]
-  //                else      [num_classes - 1, vector_count_]
-  // support_vectors_ : [vector_count_, feature_count_]
-
-  // Y: [num_batches, 1]
-  // Z: [num_batches, class_count] ??? does write extra scores increase that to 2xclass_count?
+  int write_additional_scores = -1;
   int64_t num_scores_per_batch = class_count_;
 
+  if (mode_ == SVM_TYPE::SVM_SVC && !have_proba) {
+    num_scores_per_batch = num_classifiers;
+    if (class_count_ <= 2) {
+      write_additional_scores = post_transform_ == POST_EVAL_TRANSFORM::NONE ? 2 : 0;
+    }
+  }
+
   if (mode_ == SVM_TYPE::SVM_LINEAR) {
-    scores_data.resize(N * class_count_);
+    // scores_data.resize(num_batches * class_count_);
+    // auto out = gsl::make_span<float>(scores_data.data(), scores_data.size());
 
     // combine the coefficients with the input data and apply the kernel type
-    auto out = gsl::make_span<float>(scores_data.data(), scores_data.size());
-    batched_kernel_dot(x_data, coefficients_, N, class_count_, feature_count_, rho_[0], out, threadpool);
+    batched_kernel_dot(x_data, coefficients_, num_batches, class_count_, feature_count_, rho_[0], final_scores,
+                       threadpool);
 
-    //for (int64_t j = 0; j < class_count_; j++) {  //for each class
-    //  auto val = kernel_dot(x_data, current_weight_0, coefficients_, feature_count_ * j,
-    //                        feature_count_, get_kernel_type());
-    //  val += rho_[0];
-    //  scores.push_back(val);  // N x class_count_ (coefficients is {class_count,feature_count} so N,feature . feature, class
-    //}
   } else {
-    float* classifier_scores = nullptr;
+    gsl::span<float> classifier_scores;
 
-    if (mode_ == SVM_TYPE::SVM_SVC && proba_.size() > 0) {
-      // we will write N * num_classifiers scores first, and then reduce to N * class_count_, so need
-      // to use a separate buffer for the first scoring.
-      scores_data.resize(N * class_count_);
-      classifier_scores_data.resize(N * num_classifiers);
-      classifier_scores = classifier_scores_data.data();
+    // if we have one classifier, are writing directly to the final buffer,
+    // and will add an additional score in the results, leave a space between each classifier score so that
+    // we can parallelize the batch processing below.
+    int64_t num_slots_per_iteration = write_additional_scores >= 0 ? 2 : num_classifiers;
+
+    if (have_proba) {
+      // we will write num_batches * num_classifiers scores first, and then reduce to num_batches * class_count_,
+      // so need to use a separate buffer for the first scoring.
+      classifier_scores_data.resize(num_batches * num_classifiers);
+      classifier_scores = gsl::make_span<float>(classifier_scores_data.data(), classifier_scores_data.size());
     } else {
-      // we will write directly to scores_data
-      num_scores_per_batch = num_classifiers;
-      scores_data.resize(N * num_classifiers);
-      classifier_scores = scores_data.data();
+      // we will write directly to the final scores buffer
+      // num_scores_per_batch = num_classifiers;
+      // assert(num_scores_per_batch == final_scores_per_batch);
+      classifier_scores = final_scores;
     }
 
-    kernels_data.resize(N * vector_count_);
-    votes_data.resize(N * class_count_, 0);
+    kernels_data.resize(num_batches * vector_count_);
+    votes_data.resize(num_batches * class_count_, 0);
+
+    auto kernels_span = gsl::make_span<float>(kernels_data.data(), kernels_data.size());
+    auto votes_span = gsl::make_span<int64_t>(votes_data.data(), votes_data.size());
 
     // combine the input data with the support vectors and apply the kernel type
     // output is {num_batches, vector_count_}
-    auto kernels_span = gsl::make_span<float>(kernels_data.data(), kernels_data.size());
-    batched_kernel_dot(x_data, support_vectors_, N, vector_count_, feature_count_, 0.f, kernels_span,
+    batched_kernel_dot(x_data, support_vectors_, num_batches, vector_count_, feature_count_, 0.f, kernels_span,
                        threadpool);
 
-    for (int64_t n = 0; n < N; n++) {
-      float* kernels = kernels_data.data() + (n * vector_count_);
-      float* scores = classifier_scores + (n * num_classifiers);
-      int64_t* votes = votes_data.data() + (n * class_count_);
-
+    // TODO: Parallelize the processing of each batch.
+    // Break into blocks of min 1 batch per thread, max blocks == available threads
+    for (int64_t n = 0; n < num_batches; n++) {
       // reduce scores from kernels using coefficients, taking into account the varying number of support vectors
       // per class.
       // coefficients: [num_classes - 1, vector_count_]
@@ -234,9 +246,13 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
       // Combine the scores for the two combinations for two classes with their coefficient.
       // e.g. AB combines with BA.
       // If A has 3 support vectors and B has 2, there's a 3x2 block for AB and a 2x3 block for BA to combine
-      //
 
-      // votes.assign(class_count_, 0);
+      auto cur_kernels = kernels_span.subspan(n * vector_count_, vector_count_);
+      auto cur_scores = classifier_scores.subspan(n * num_slots_per_iteration, num_classifiers);
+      auto cur_votes = votes_span.subspan(n * class_count_, class_count_);
+      auto scores_iter = cur_scores.begin();
+
+      int64_t classifier_idx = 0;
       for (int64_t i = 0; i < class_count_ - 1; i++) {
         int64_t start_index_i = starting_vector_[i];  // start of support vectors for class i
         int64_t class_i_support_count = vectors_per_class_[i];
@@ -250,36 +266,28 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
           double sum = 0;
 
           const float* val1 = &(coefficients_[j_coeff_row_offset + start_index_i]);
-          const float* val2 = &(kernels[start_index_i]);
+          const float* val2 = &(cur_kernels[start_index_i]);
           for (int64_t m = 0; m < class_i_support_count; ++m, ++val1, ++val2)
             sum += *val1 * *val2;
 
           val1 = &(coefficients_[i_coeff_row_offset + start_index_j]);
-          val2 = &(kernels[start_index_j]);
+          val2 = &(cur_kernels[start_index_j]);
 
           for (int64_t m = 0; m < class_j_support_count; ++m, ++val1, ++val2)
             sum += *val1 * *val2;
 
-          sum += rho_[i];  // rho_ entry for this classifier
+          sum += rho_[classifier_idx++];
 
-          *scores = static_cast<float>(sum);
-          ++scores;
-          ++votes[sum > 0 ? i : j];
+          *scores_iter++ = static_cast<float>(sum);
+          ++(cur_votes[sum > 0 ? i : j]);
         }
       }
-
-      assert(scores == classifier_scores + ((n + 1) * num_classifiers));
     }
   }
 
-  for (int64_t n = 0; n < N; n++)  //for each example
+  for (int64_t n = 0; n < num_batches; n++)  //for each example
   {
-    float* _scores = scores_data.data() + (n * num_scores_per_batch);
-
-    //!!!
-    // temporary copy of scores into vector until other parts handle a gsl::span instead
-    //!!!
-    std::vector<float> scores(_scores, _scores + num_scores_per_batch);
+    auto cur_scores = final_scores.subspan(n * final_scores_per_batch, final_scores_per_batch);
 
     if (mode_ == SVM_TYPE::SVM_SVC && have_proba) {
       auto probsp2 = gsl::make_span<float>(probsp2_data.data() + (n * class_count_squared), class_count_squared);
@@ -301,7 +309,8 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
         }
       }
 
-      multiclass_probability(class_count_, probsp2, scores);
+      // expand scores from num_classifiers to class_count_
+      multiclass_probability(class_count_, probsp2, cur_scores);
     }
 
     float max_weight = 0;
@@ -311,36 +320,36 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
       auto it_maxvotes = std::max_element(votes.cbegin(), votes.cend());
       maxclass = std::distance(votes.cbegin(), it_maxvotes);
     } else {
-      auto it_max_weight = std::max_element(scores.cbegin(), scores.cend());
-      maxclass = std::distance(scores.cbegin(), it_max_weight);
+      auto it_max_weight = std::max_element(cur_scores.cbegin(), cur_scores.cend());
+      maxclass = std::distance(cur_scores.cbegin(), it_max_weight);
       max_weight = *it_max_weight;
     }
 
     // write top class
     // onnx specs expects one column per class.
-    int write_additional_scores = -1;
-    if (rho_.size() == 1) {
+    if (num_classifiers == 1) {  // binary case
       if (using_strings_) {
-        write_additional_scores = _set_score_svm<std::string>(Y, max_weight, maxclass, n, post_transform_, proba_,
-                                                              weights_are_all_positive_, classlabels_strings_,
-                                                              "1", "0");
+        ChooseClass<std::string>(Y, n, max_weight, maxclass, post_transform_,
+                                 have_proba, weights_are_all_positive_,
+                                 classlabels_strings_, "1", "0");
       } else {
-        write_additional_scores = _set_score_svm<int64_t>(Y, max_weight, maxclass, n, post_transform_, proba_,
-                                                          weights_are_all_positive_, classlabels_ints_,
-                                                          1, 0);
+        ChooseClass<int64_t>(Y, n, max_weight, maxclass, post_transform_,
+                             have_proba, weights_are_all_positive_,
+                             classlabels_ints_, 1, 0);
       }
     } else {  //multiclass
       if (using_strings_) {
-        Y->template MutableData<std::string>()[n] = classlabels_strings_[maxclass];
+        Y.template MutableData<std::string>()[n] = classlabels_strings_[maxclass];
       } else {
-        Y->template MutableData<int64_t>()[n] = classlabels_ints_[maxclass];
+        Y.template MutableData<int64_t>()[n] = classlabels_ints_[maxclass];
       }
     }
 
-    // we only write an extra score if there are 2 classes, and num_scores_per_batch == num_classifiers
-    // which means there's only one entry in scores
-    write_scores(scores, post_transform_, zindex, Z, write_additional_scores);
-    zindex += scores.size();
+    // write the score for this batch
+    // as we parallelize the batch processing we want to update the final scores in the different threads
+    // instead of doing a single pass at the end to update the final scores.
+    batched_update_scores_inplace<float>(cur_scores, 1, num_scores_per_batch, post_transform_,
+                                         write_additional_scores, true, threadpool);
   }
 
   return Status::OK();
