@@ -55,6 +55,7 @@ SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
   } else {
     class_count_ = 1;
   }
+
   if (vector_count_ > 0) {
     feature_count_ = support_vectors_.size() / vector_count_;  //length of each support vector
     mode_ = SVM_TYPE::SVM_SVC;
@@ -63,6 +64,7 @@ SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
     mode_ = SVM_TYPE::SVM_LINEAR;
     set_kernel_type(KERNEL::LINEAR);
   }
+
   ORT_ENFORCE(classlabels_strings_.size() > 0 || classlabels_ints_.size() > 0);
   ORT_ENFORCE(proba_.size() == probb_.size());
   ORT_ENFORCE(coefficients_.size() > 0);
@@ -151,8 +153,6 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
   std::vector<float> classifier_scores_data;
   std::vector<float> probsp2_data;
 
-  scores_data.resize(N * class_count_);
-
   if (have_proba && mode_ == SVM_TYPE::SVM_SVC) {
     probsp2_data.resize(N * class_count_squared, 0.f);
   }
@@ -172,6 +172,8 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
   int64_t num_scores_per_batch = class_count_;
 
   if (mode_ == SVM_TYPE::SVM_LINEAR) {
+    scores_data.resize(N * class_count_);
+
     // combine the coefficients with the input data and apply the kernel type
     auto out = gsl::make_span<float>(scores_data.data(), scores_data.size());
     batched_kernel_dot(x_data, coefficients_, N, class_count_, feature_count_, rho_[0], out, threadpool);
@@ -183,16 +185,19 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     //  scores.push_back(val);  // N x class_count_ (coefficients is {class_count,feature_count} so N,feature . feature, class
     //}
   } else {
-    float* classifier_scores = scores_data.data();
+    float* classifier_scores = nullptr;
 
     if (mode_ == SVM_TYPE::SVM_SVC && proba_.size() > 0) {
       // we will write N * num_classifiers scores first, and then reduce to N * class_count_, so need
       // to use a separate buffer for the first scoring.
+      scores_data.resize(N * class_count_);
       classifier_scores_data.resize(N * num_classifiers);
       classifier_scores = classifier_scores_data.data();
     } else {
       // we will write directly to scores_data
       num_scores_per_batch = num_classifiers;
+      scores_data.resize(N * num_classifiers);
+      classifier_scores = scores_data.data();
     }
 
     kernels_data.resize(N * vector_count_);
@@ -203,14 +208,6 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     auto kernels_span = gsl::make_span<float>(kernels_data.data(), kernels_data.size());
     batched_kernel_dot(x_data, support_vectors_, N, vector_count_, feature_count_, 0.f, kernels_span,
                        threadpool);
-
-    // ## combine inputs with support vectors as per SVMR. write to kernels.data()
-    //for (int64_t j = 0; j < vector_count_; j++) {
-    //  auto val = kernel_dot(x_data, current_weight_0, support_vectors_, feature_count_ * j,
-    //                        feature_count_, get_kernel_type());
-    //  *kernel = val;
-    //  ++kernel;
-    //}
 
     for (int64_t n = 0; n < N; n++) {
       float* kernels = kernels_data.data() + (n * vector_count_);
@@ -227,7 +224,7 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
       // BA BB BC
       // CA CB CC
       //
-      // you can remove the items comparing a class with itself leaving one less row.
+      // you can remove the diagonal line of items comparing a class with itself leaving one less row.
       //
       // BA AB AC
       // CA CB BC
@@ -268,9 +265,6 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
           *scores = static_cast<float>(sum);
           ++scores;
           ++votes[sum > 0 ? i : j];
-
-          // ++(votes[sum > 0 ? i : j]);
-          // scores.push_back(static_cast<float>(sum));  // N * num_classifiers
         }
       }
 
@@ -280,24 +274,17 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
 
   for (int64_t n = 0; n < N; n++)  //for each example
   {
-    float* _scores = scores_data.data() + (n + num_scores_per_batch);
+    float* _scores = scores_data.data() + (n * num_scores_per_batch);
 
     //!!!
     // temporary copy of scores into vector until other parts handle a gsl::span instead
     //!!!
     std::vector<float> scores(_scores, _scores + num_scores_per_batch);
 
-    auto probsp2 = gsl::make_span<float>(probsp2_data.data() + (n * class_count_squared), class_count_squared);
+    if (mode_ == SVM_TYPE::SVM_SVC && have_proba) {
+      auto probsp2 = gsl::make_span<float>(probsp2_data.data() + (n * class_count_squared), class_count_squared);
 
-    if (mode_ == SVM_TYPE::SVM_SVC && proba_.size() > 0) {
       float* classifier_scores = classifier_scores_data.data() + (n * num_classifiers);
-
-      // compute probabilities from the scores. output is { class_count, class_count }
-      // probsp2.assign(class_count_squared, 0.f);
-      // zero out the diagonal
-      // for (int64_t i = 0; i < class_count_; ++i) {
-      //   probsp2[i * class_count_ + i] = 0.f;
-      // }
 
       int64_t index = 0;
       for (int64_t i = 0; i < class_count_ - 1; ++i) {

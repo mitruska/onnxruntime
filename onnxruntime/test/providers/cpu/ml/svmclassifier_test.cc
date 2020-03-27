@@ -220,5 +220,47 @@ TEST(MLOpTest, SVMClassifierSVCDouble) {
   test.Run();
 }
 
+TEST(MLOpTest, SVMClassifierLinear) {
+  OpTester test("SVMClassifier", 1, onnxruntime::kMLDomain);
+
+  std::vector<float> coefficients = {0.766398549079895, 0.0871576070785522, 0.110420741140842,
+                                     -0.963976919651031};
+  std::vector<float> support_vectors = {4.80000019073486, 3.40000009536743, 1.89999997615814,
+                                        5., 3., 1.60000002384186,
+                                        4.5, 2.29999995231628, 1.29999995231628,
+                                        5.09999990463257, 2.5, 3.};
+  std::vector<float> rho = {2.23510527610779};
+  std::vector<float> kernel_params = {0.122462183237076, 0, 3};  //gamma, coef0, degree
+  std::vector<int64_t> classes = {0, 1};
+  std::vector<int64_t> vectors_per_class = {3, 1};
+
+  std::vector<float> X = {5.1, 3.5, 1.4,
+                          4.9, 3., 1.4,
+                          4.7, 3.2, 1.3,
+                          4.6, 3.1, 1.5,
+                          5., 3.6, 1.4};
+  std::vector<float> scores_predictions = {-1.5556798, 1.5556798,
+                                           -1.2610321, 1.2610321,
+                                           -1.5795376, 1.5795376,
+                                           -1.3083477, 1.3083477,
+                                           -1.6572928, 1.6572928};
+
+  std::vector<int64_t> class_predictions = {0, 0, 0, 0, 0};
+
+  test.AddAttribute("kernel_type", std::string("LINEAR"));
+  test.AddAttribute("coefficients", coefficients);
+  test.AddAttribute("support_vectors", support_vectors);
+  test.AddAttribute("vectors_per_class", vectors_per_class);
+  test.AddAttribute("rho", rho);
+  test.AddAttribute("kernel_params", kernel_params);
+  test.AddAttribute("classlabels_ints", classes);
+
+  test.AddInput<float>("X", {5, 3}, X);
+  test.AddOutput<int64_t>("Y", {5}, class_predictions);
+  test.AddOutput<float>("Z", {5, 2}, scores_predictions);
+
+  test.Run();
+}
+
 }  // namespace test
 }  // namespace onnxruntime
