@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 
 #include "core/providers/cpu/ml/svmclassifier.h"
+#include "core/platform/threadpool.h"
 
 namespace onnxruntime {
 namespace ml {
@@ -132,9 +133,10 @@ Status SVMClassifier<T>::Compute(OpKernelContext* /*ctx*/) const {
 template <>
 Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
   concurrency::ThreadPool* threadpool = ctx->GetOperatorThreadPool();
+
   const auto* X = ctx->Input<Tensor>(0);
   const auto x_data = X->template DataAsSpan<float>();
-  const auto num_batches = X->Shape().NumDimensions() == 1 ? 1 : X->Shape()[0];
+  const auto num_batches = SafeInt<int32_t>(X->Shape().NumDimensions() == 1 ? 1 : X->Shape()[0]);
 
   // Total number of classifiers comparing pairs between the classes
   // e.g. if you have A, B C and D classes, the number of classifiers to compare between each pair is 6
@@ -200,7 +202,7 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     int64_t num_slots_per_iteration = write_additional_scores >= 0 ? 2 : num_classifiers;
 
     if (have_proba) {
-      // we will write num_batches * num_classifiers scores first, and then reduce to num_batches * class_count_,
+      // we will write num_batches * num_classifiers scores first, and transform those to num_batches * class_count_,
       // so need to use a separate buffer for the first scoring.
       classifier_scores_data.resize(num_batches * num_classifiers);
       classifier_scores = gsl::make_span<float>(classifier_scores_data.data(), classifier_scores_data.size());
@@ -222,8 +224,6 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     batched_kernel_dot(x_data, support_vectors_, num_batches, vector_count_, feature_count_, 0.f, kernels_span,
                        threadpool);
 
-    // TODO: Parallelize the processing of each batch.
-    // Break into blocks of min 1 batch per thread, max blocks == available threads
     for (int64_t n = 0; n < num_batches; n++) {
       // reduce scores from kernels using coefficients, taking into account the varying number of support vectors
       // per class.
@@ -284,8 +284,10 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     }
   }
 
-  for (int64_t n = 0; n < num_batches; n++)  //for each example
-  {
+  auto finalize_batch = [this, &final_scores, final_scores_per_batch,
+                         have_proba, &probsp2_data, class_count_squared,
+                         &classifier_scores_data, num_classifiers, &votes_data, &Y,
+                         num_scores_per_batch, write_additional_scores](int32_t n) {
     auto cur_scores = final_scores.subspan(n * final_scores_per_batch, final_scores_per_batch);
 
     if (mode_ == SVM_TYPE::SVM_SVC && have_proba) {
@@ -346,7 +348,18 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     // as we parallelize the batch processing we want to update the final scores in the different threads
     // instead of doing a single pass at the end to update the final scores.
     batched_update_scores_inplace<float>(cur_scores, 1, num_scores_per_batch, post_transform_,
-                                         write_additional_scores, true, threadpool);
+                                         write_additional_scores, true, nullptr);
+  };
+
+  // TODO: Refine this rough metric to choose when to parallelize.
+  if (num_batches > 512) {
+    concurrency::ThreadPool::TryBatchParallelFor(threadpool, num_batches, finalize_batch);
+  } else {
+    {
+      for (int32_t i = 0; i < num_batches; ++i) {
+        finalize_batch(i);
+      }
+    }
   }
 
   return Status::OK();

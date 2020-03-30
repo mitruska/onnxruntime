@@ -226,7 +226,8 @@ static inline void multiclass_probability(int64_t classcount,
       }
     }
 
-    if (max_error < eps) break;
+    if (max_error < eps)
+      break;
 
     for (int64_t i = 0; i < classcount; i++) {
       float diff = (-Qp[i] + pQp) / Q[i * classcount + i];
