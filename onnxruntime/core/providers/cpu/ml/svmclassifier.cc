@@ -7,23 +7,21 @@
 namespace onnxruntime {
 namespace ml {
 
-#define ADD_IN_TYPE_SVM_CLASSIFIER_OP(in_type)                                                                                                                                                    \
-  ONNX_CPU_OPERATOR_TYPED_ML_KERNEL(                                                                                                                                                              \
-      SVMClassifier,                                                                                                                                                                              \
-      1,                                                                                                                                                                                          \
-      in_type,                                                                                                                                                                                    \
-      KernelDefBuilder().TypeConstraint("T1", DataTypeImpl::GetTensorType<in_type>()).TypeConstraint("T2", {DataTypeImpl::GetTensorType<int64_t>(), DataTypeImpl::GetTensorType<std::string>()}), \
-      SVMClassifier<in_type>);
+ONNX_CPU_OPERATOR_ML_KERNEL(
+    SVMClassifier,
+    1,
+    KernelDefBuilder()
+        .TypeConstraint("T1", std::vector<MLDataType>{
+                                  DataTypeImpl::GetTensorType<float>(),
+                                  DataTypeImpl::GetTensorType<double>(),
+                                  DataTypeImpl::GetTensorType<int32_t>(),
+                                  DataTypeImpl::GetTensorType<int64_t>()})
+        .TypeConstraint("T2", {DataTypeImpl::GetTensorType<int64_t>(), DataTypeImpl::GetTensorType<std::string>()}),
+    SVMClassifier);
 
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(float);
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(double);
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(int64_t);
-ADD_IN_TYPE_SVM_CLASSIFIER_OP(int32_t);
-
-template <typename T>
-SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
+SVMClassifier::SVMClassifier(const OpKernelInfo& info)
     : OpKernel(info),
-      SVMCommon<T>(info),
+      SVMCommon(info),
       vectors_per_class_(info.GetAttrsOrDefault<int64_t>("vectors_per_class")),
       proba_(info.GetAttrsOrDefault<float>("prob_a")),
       probb_(info.GetAttrsOrDefault<float>("prob_b")),
@@ -74,33 +72,6 @@ SVMClassifier<T>::SVMClassifier(const OpKernelInfo& info)
 }
 
 template <typename LabelType>
-static int _set_score_svm(Tensor* Y, float max_weight, const int64_t maxclass, const int64_t n,
-                          POST_EVAL_TRANSFORM post_transform_, const std::vector<float>& proba_,
-                          bool weights_are_all_positive_,
-                          const std::vector<LabelType>& classlabels, LabelType posclass, LabelType negclass) {
-  int write_additional_scores = -1;
-  auto output_data = Y->template MutableData<LabelType>();
-  if (classlabels.size() == 2) {
-    write_additional_scores = post_transform_ == POST_EVAL_TRANSFORM::NONE ? 2 : 0;
-    if (proba_.size() == 0) {
-      if (weights_are_all_positive_ && max_weight >= 0.5)
-        output_data[n] = classlabels[1];
-      else if (max_weight > 0 && !weights_are_all_positive_)
-        output_data[n] = classlabels[1];
-      else
-        output_data[n] = classlabels[maxclass];
-    } else {
-      output_data[n] = classlabels[maxclass];
-    }
-  } else if (max_weight > 0) {
-    output_data[n] = posclass;
-  } else {
-    output_data[n] = negclass;
-  }
-  return write_additional_scores;
-}
-
-template <typename LabelType>
 static void ChooseClass(Tensor& output, const int64_t output_idx, float max_weight, const int64_t maxclass,
                         bool have_proba, bool weights_are_all_positive,
                         const std::vector<LabelType>& classlabels,
@@ -125,18 +96,65 @@ static void ChooseClass(Tensor& output, const int64_t output_idx, float max_weig
   }
 }
 
-template <typename T>
-Status SVMClassifier<T>::Compute(OpKernelContext* /*ctx*/) const {
-  ORT_NOT_IMPLEMENTED();
+Status SVMClassifier::Compute(OpKernelContext* ctx) const {
+  Status status = Status::OK();
+  const auto& X = *ctx->Input<Tensor>(0);
+  const auto& x_shape = X.Shape();
+
+  AllocatorPtr allocator;
+  auto element_type = X.GetElementType();
+  gsl::span<const float> x_data;
+  float* tmp_data = nullptr;
+
+  if (element_type == ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    x_data = X.DataAsSpan<float>();
+  } else {
+    // need to cast the input to float so we can use the fast GEMM implementations
+    auto num_elements = x_shape.Size();
+
+    ORT_RETURN_IF_ERROR(ctx->GetTempSpaceAllocator(&allocator));
+    tmp_data = static_cast<float*>(allocator->AllocArray(num_elements, sizeof(float)));
+
+    switch (element_type) {
+      case ONNX_NAMESPACE::TensorProto_DataType_DOUBLE: {
+        auto in_vector = ConstEigenVectorMap<double>(X.Data<double>(), num_elements);
+        auto output_vector = EigenVectorMap<float>(tmp_data, num_elements);
+        output_vector = in_vector.cast<float>();
+        break;
+      }
+      case ONNX_NAMESPACE::TensorProto_DataType_INT32: {
+        auto in_vector = ConstEigenVectorMap<int32_t>(X.Data<int32_t>(), num_elements);
+        auto output_vector = EigenVectorMap<float>(tmp_data, num_elements);
+        output_vector = in_vector.cast<float>();
+        break;
+      }
+      case ONNX_NAMESPACE::TensorProto_DataType_INT64: {
+        auto in_vector = ConstEigenVectorMap<int64_t>(X.Data<int64_t>(), num_elements);
+        auto output_vector = EigenVectorMap<float>(tmp_data, num_elements);
+        output_vector = in_vector.cast<float>();
+        break;
+      }
+      default:
+        return ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, "Unsupported data type of ", element_type);
+    }
+
+    x_data = gsl::make_span<const float>(tmp_data, num_elements);
+  }
+
+  status = ComputeImpl(*ctx, x_data, x_shape);
+
+  if (element_type != ONNX_NAMESPACE::TensorProto_DataType_FLOAT) {
+    allocator->Free(tmp_data);
+  }
+
+  return status;
 }
 
-template <>
-Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
-  concurrency::ThreadPool* threadpool = ctx->GetOperatorThreadPool();
+Status SVMClassifier::ComputeImpl(OpKernelContext& ctx,
+                                  gsl::span<const float> x_data, const TensorShape& x_shape) const {
+  concurrency::ThreadPool* threadpool = ctx.GetOperatorThreadPool();
 
-  const auto* X = ctx->Input<Tensor>(0);
-  const auto x_data = X->template DataAsSpan<float>();
-  const auto num_batches = SafeInt<int32_t>(X->Shape().NumDimensions() == 1 ? 1 : X->Shape()[0]);
+  const auto num_batches = SafeInt<int32_t>(x_shape.NumDimensions() == 1 ? 1 : x_shape[0]);
 
   // Total number of classifiers comparing pairs between the classes
   // e.g. if you have A, B C and D classes, the number of classifiers to compare between each pair is 6
@@ -160,8 +178,8 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
   // support_vectors_ : [vector_count_, feature_count_]
 
   // both outputs are required so can't be nullptr
-  Tensor& Y = *ctx->Output(0, TensorShape({num_batches}));
-  Tensor& Z = *ctx->Output(1, TensorShape({num_batches, final_scores_per_batch}));
+  Tensor& Y = *ctx.Output(0, TensorShape({num_batches}));
+  Tensor& Z = *ctx.Output(1, TensorShape({num_batches, final_scores_per_batch}));
 
   auto final_scores = Z.MutableDataAsSpan<float>();
 
@@ -171,7 +189,7 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
   std::vector<float> classifier_scores_data;
   std::vector<float> probsp2_data;
 
-  if (have_proba && mode_ == SVM_TYPE::SVM_SVC) {
+  if (mode_ == SVM_TYPE::SVM_SVC && have_proba) {
     probsp2_data.resize(num_batches * class_count_squared, 0.f);
   }
 
@@ -190,8 +208,8 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     // auto out = gsl::make_span<float>(scores_data.data(), scores_data.size());
 
     // combine the coefficients with the input data and apply the kernel type
-    batched_kernel_dot(x_data, coefficients_, num_batches, class_count_, feature_count_, rho_[0], final_scores,
-                       threadpool);
+    batched_kernel_dot<float>(x_data, coefficients_, num_batches, class_count_, feature_count_, rho_[0], final_scores,
+                              threadpool);
 
   } else {
     gsl::span<float> classifier_scores;
@@ -221,8 +239,8 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
 
     // combine the input data with the support vectors and apply the kernel type
     // output is {num_batches, vector_count_}
-    batched_kernel_dot(x_data, support_vectors_, num_batches, vector_count_, feature_count_, 0.f, kernels_span,
-                       threadpool);
+    batched_kernel_dot<float>(x_data, support_vectors_, num_batches, vector_count_, feature_count_, 0.f, kernels_span,
+                              threadpool);
 
     for (int64_t n = 0; n < num_batches; n++) {
       // reduce scores from kernels using coefficients, taking into account the varying number of support vectors
@@ -345,8 +363,7 @@ Status SVMClassifier<float>::Compute(OpKernelContext* ctx) const {
     }
 
     // write the score for this batch
-    // as we parallelize the batch processing we want to update the final scores in the different threads
-    // instead of doing a single pass at the end to update the final scores.
+    // as we parallelize the batch processing we want to update the final scores for each batch in the separate threads
     batched_update_scores_inplace<float>(cur_scores, 1, num_scores_per_batch, post_transform_,
                                          write_additional_scores, true, nullptr);
   };
