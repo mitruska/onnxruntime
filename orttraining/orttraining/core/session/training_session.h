@@ -213,6 +213,9 @@ class TrainingSession : public InferenceSession {
   /** Gets the model location. */
   const PathString& GetModelLocation() const { return model_location_; }
 
+  /** Checks to be see if given graph output is produced by an fp32-only node. */
+  bool IsGraphOutputFp32Node(const std::string& output_name) const;
+
  private:
   /** Add a graph input suitable for use as a scaling factor for loss scaling.
   It will be a scalar float tensor.
